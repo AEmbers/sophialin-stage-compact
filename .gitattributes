@@ -1,0 +1,10 @@
+# Byte-exact golden snapshots must check out as LF on every platform (#1305).
+# Without this, Git-for-Windows' default autocrlf=true converts them to CRLF at
+# checkout and the byte-equal golden gates fail on every Windows CI run.
+tests/golden/wire-contract/*.json text eol=lf
+
+# dist/ is committed (see .gitignore): repository installs cannot build it.
+# Pin the bundle to LF so the checked-in artifact stays byte-identical to what
+# `npm run build` produces on every platform — Git-for-Windows' autocrlf=true
+# would otherwise rewrite its line endings on commit and on checkout.
+dist/** text eol=lf
