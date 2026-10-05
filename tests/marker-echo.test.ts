@@ -9,7 +9,8 @@ import { pipePluginChatWithStrip, pipePluginResponsesWithStrip } from "../src/pl
 import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
 import { rewriteResponsesJsonResponse } from "../src/stream-responses.ts";
-import { buildCompressSystemPrompt, withMarkerIntegrityNote, withSummaryBudgetNote } from "../src/compress-tool.ts";
+import { COMPRESS_TOOL } from "acp-kernel";
+import { BILI_ACP_TOOLS_ANTHROPIC, BILI_COMPRESS_TOOL, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, withContinuationAnchor, withMarkerIntegrityNote, withSummaryBudgetNote } from "../src/compress-tool.ts";
 import { setLogCapture } from "../src/logger.ts";
 
 const LT = "\x3c";
@@ -306,6 +307,31 @@ test("#888: withSummaryBudgetNote is a byte-stable constant (prefix-cache safe)"
     const b = withSummaryBudgetNote("BBB");
     // Same suffix regardless of input → no dynamic values leak into the anchor.
     assert.equal(a.slice(3), b.slice(3));
+});
+
+test("AutoCompact: the served compress tool carries the trigger rubric", () => {
+    assert.ok(BILI_COMPRESS_TOOL.description.startsWith(COMPRESS_TOOL.description), "kernel description preserved verbatim");
+    assert.ok(BILI_COMPRESS_TOOL.description.includes("the trigger rubric"));
+    assert.ok(BILI_COMPRESS_TOOL.description.includes("Fold when a STAGE RESOLVES, not when the window fills"));
+    assert.ok(BILI_COMPRESS_TOOL.description.includes("a subtask is finished and its result is in hand"));
+    assert.ok(BILI_COMPRESS_TOOL.description.includes("Occupancy is not a reason to fold"));
+    // Only the description is ours — the schema stays the kernel's.
+    assert.deepEqual(BILI_COMPRESS_TOOL.input_schema, COMPRESS_TOOL.input_schema);
+    const served = BILI_ACP_TOOLS_ANTHROPIC.find((t) => t.name === COMPRESS_TOOL_NAME) as { description?: string } | undefined;
+    assert.ok(served?.description?.includes("the trigger rubric"), "the advertised surface carries it too");
+});
+
+test("AutoCompact: withContinuationAnchor rides a successful fold only", () => {
+    const base = "[Compressed m00120–m00300 → 1 block(s), ~12K tokens saved.]";
+    const ok = withContinuationAnchor(base);
+    assert.ok(ok.startsWith(base), "result text preserved verbatim");
+    assert.ok(ok.includes("the fold above is live"));
+    assert.ok(ok.includes("Continue FROM it"));
+    assert.ok(ok.includes("nor re-derive a conclusion it already settles"));
+    const rejected = "compress FAILED: range below the minimum size";
+    assert.equal(withContinuationAnchor(rejected), rejected, "a rejected call left nothing to continue from");
+    // Byte-stable suffix, like the sibling notes (prefix-cache safe).
+    assert.equal(ok.slice(base.length), withContinuationAnchor("AAA").slice(3));
 });
 
 test("responses passthrough strips a whole forged marker delta (fast-path bypass #717)", async () => {

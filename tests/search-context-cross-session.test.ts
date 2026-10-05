@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { ACP_READONLY_TOOLS_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, DECOMPRESS_TOOL_NAME, SEARCH_CONTEXT_TOOL_NAME, createCore, createInitialState, defaultConfig } from "acp-kernel";
+import { ACP_READONLY_TOOLS_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, DECOMPRESS_TOOL_NAME, SEARCH_CONTEXT_TOOL_NAME, createCore, createInitialState, defaultConfig } from "acp-kernel";
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
 import { BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -47,7 +47,7 @@ function compressInto(session: Session) {
     return core;
 }
 
-type FlatTool = { name?: string; description?: string; input_schema?: Record<string, unknown>; parameters?: Record<string, unknown>; function?: { name?: string; parameters?: Record<string, unknown> } };
+type FlatTool = { name?: string; description?: string; input_schema?: Record<string, unknown>; parameters?: Record<string, unknown>; function?: { name?: string; description?: string; parameters?: Record<string, unknown> } };
 
 function searchEntry(arr: unknown[], shape: "flat" | "openai"): FlatTool | undefined {
     return arr.find((t) => {
@@ -60,7 +60,7 @@ function paramsOf(entry: FlatTool): Record<string, unknown> {
     return entry.parameters ?? entry.input_schema ?? entry.function?.parameters ?? {};
 }
 
-test("#841 schema: BILI arrays no longer add conversation_id to search_context (#1685); #1179 range args stay on decompress", () => {
+test("#841 schema: BILI arrays no longer add conversation_id to search_context (#1685); #1179 range args stay on decompress; compress is a description-only delta", () => {
     const cases: [unknown[], unknown[], "flat" | "openai"][] = [
         [BILI_ACP_TOOLS_ANTHROPIC, ACP_TOOLS_ANTHROPIC, "flat"],
         [BILI_ACP_TOOLS_OPENAI, ACP_TOOLS_OPENAI, "openai"],
@@ -103,9 +103,30 @@ test("#841 schema: BILI arrays no longer add conversation_id to search_context (
         const decRequired = paramsOf(biliDec).required as string[] | undefined;
         assert.ok(!decRequired?.includes("startId") && !decRequired?.includes("endId"), "range args must stay optional");
 
-        const biliRest = bili.filter((t) => t !== entry && nameOf(t) !== DECOMPRESS_TOOL_NAME);
-        const kernelRest = kernel.filter((t) => t !== kernelEntry && nameOf(t) !== DECOMPRESS_TOOL_NAME);
+        const biliRest = bili.filter((t) => t !== entry && nameOf(t) !== DECOMPRESS_TOOL_NAME && nameOf(t) !== COMPRESS_TOOL_NAME);
+        const kernelRest = kernel.filter((t) => t !== kernelEntry && nameOf(t) !== DECOMPRESS_TOOL_NAME && nameOf(t) !== COMPRESS_TOOL_NAME);
         assert.deepEqual(biliRest, kernelRest, "no other tool may change");
+
+        // compress carries the fork's trigger rubric as a PURE SUFFIX on the kernel
+        // description — the tool object is otherwise byte-identical to the kernel's.
+        const descOnly = (e: FlatTool): FlatTool => {
+            const rest: FlatTool = { ...e };
+            delete rest.description;
+            const fn = rest.function;
+            if (fn !== undefined) {
+                const fnRest = { ...fn };
+                delete fnRest.description;
+                rest.function = fnRest;
+            }
+            return rest;
+        };
+        const biliCmp = bili.find((t) => nameOf(t) === COMPRESS_TOOL_NAME) as FlatTool | undefined;
+        const kernelCmp = kernel.find((t) => nameOf(t) === COMPRESS_TOOL_NAME) as FlatTool | undefined;
+        assert.ok(biliCmp && kernelCmp, `compress missing in ${shape} array`);
+        assert.deepEqual(descOnly(biliCmp), descOnly(kernelCmp), "compress differs from the kernel tool only by its description");
+        const biliDesc = (biliCmp.description ?? biliCmp.function?.description) as string;
+        const kernelDesc = (kernelCmp.description ?? kernelCmp.function?.description) as string;
+        assert.ok(biliDesc.startsWith(kernelDesc) && biliDesc.length > kernelDesc.length, "the trigger rubric rides as a pure suffix");
     }
     const ro = searchEntry(BILI_ACP_READONLY_TOOLS_RESPONSES, "flat")!;
     assert.equal((paramsOf(ro).properties as Record<string, unknown>).conversation_id, undefined, "#1685: readonly array clean too");

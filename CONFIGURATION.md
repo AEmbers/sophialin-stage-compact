@@ -372,7 +372,7 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `number`
 - **Default:** `50000`
 - **Status:** ACTIVE
-- **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step).
+- **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step). **Scale it to your window.** The step counts *compressible* tokens, so a value that is a large fraction of the window keeps the growth layer silent for most of a session — a live 1M-window deployment set to `350000` produced 120 consecutive idle turns while usage drifted to 148% before the emergency line fired. The kernel's adaptive band is ~5% of the window (and its default 50000 already equals that for a 1M window); anything past a quarter of the window raises a one-time `nudgeGrowthTokens … % of the context window` warning at startup. Leave it unset unless you specifically want a coarser or finer cadence than ~5%.
 
 #### `preserveRecentMessages`
 

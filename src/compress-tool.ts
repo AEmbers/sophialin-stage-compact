@@ -31,6 +31,11 @@ import {
     SEARCH_CONTEXT_TOOL_OPENAI,
     SEARCH_CONTEXT_TOOL_RESPONSES,
     SEARCH_CONTEXT_TOOL_NAME,
+    COMPRESS_TOOL,
+    COMPRESS_TOOL_GOOGLE,
+    COMPRESS_TOOL_NAME,
+    COMPRESS_TOOL_OPENAI,
+    COMPRESS_TOOL_RESPONSES,
     ACP_TOOLS_ANTHROPIC,
     ACP_TOOLS_GOOGLE,
     ACP_TOOLS_OPENAI,
@@ -131,6 +136,59 @@ export const BILI_SEARCH_CONTEXT_TOOL_GOOGLE = {
     parameters: SEARCH_CONTEXT_TOOL_GOOGLE.parameters as JsonSchemaObject,
 };
 
+// Trigger rubric (arXiv:2610.02163, AutoCompact). The paper's first supervised
+// behaviour is *when* to fold, and its finding is that a rule stated once in a
+// system prompt does not move the decision: the model does not interrupt a
+// working trajectory on its own. The moment of decision is the tool surface —
+// the description is read every time the model weighs a call — so the rubric
+// rides there, next to the two notes the fork already appends to nudges and
+// prompts. Byte-stable constant (no dynamic values) so the prefix-cache anchor
+// stays intact.
+const TRIGGER_RUBRIC_NOTE =
+    "\n\n[When to call this — the trigger rubric. Fold when a STAGE RESOLVES, not when the window fills: a subtask is finished and its result is in hand; a check, build or test result settles the question; the cause is localized and the next work is implementation; or you are switching tasks and the old one's evidence is no longer live. Do NOT fold while intermediate evidence is still needed — a stage you are still working through must survive intact. Do NOT wait for a context warning: by the time a threshold fires you have already paid, on every turn since the stage resolved, for stale exploration you meant to drop. Occupancy is not a reason to fold; a resolved stage is.]";
+
+const CONTINUATION_ANCHOR_NOTE =
+    "\n\n[Continuation: the fold above is live — you are now reading your own working-state summary in place of the folded turns. Continue FROM it. Take the NEXT ACTIONS it records, in order, and neither re-run exploration whose result it already states nor re-derive a conclusion it already settles. Reach for decompress or search_context only when you need exact bytes the summary cannot supply. The stage that produced this summary is finished; do not re-open it.]";
+
+/** Same schema as the kernel's compress tool, with the trigger rubric appended
+ *  to the served description. */
+export const BILI_COMPRESS_TOOL = {
+    ...COMPRESS_TOOL,
+    description: COMPRESS_TOOL.description + TRIGGER_RUBRIC_NOTE,
+};
+
+export const BILI_COMPRESS_TOOL_OPENAI = {
+    ...COMPRESS_TOOL_OPENAI,
+    function: {
+        ...COMPRESS_TOOL_OPENAI.function,
+        description: COMPRESS_TOOL_OPENAI.function.description + TRIGGER_RUBRIC_NOTE,
+    },
+};
+
+export const BILI_COMPRESS_TOOL_RESPONSES = {
+    ...COMPRESS_TOOL_RESPONSES,
+    description: COMPRESS_TOOL_RESPONSES.description + TRIGGER_RUBRIC_NOTE,
+};
+
+export const BILI_COMPRESS_TOOL_GOOGLE = {
+    ...COMPRESS_TOOL_GOOGLE,
+    description: COMPRESS_TOOL_GOOGLE.description + TRIGGER_RUBRIC_NOTE,
+};
+
+/** The OpenAI tool list carrying the fork's compress description, for the native
+ *  faces (opencode v1/v2) that build their own tool objects from the kernel list
+ *  rather than from a `BILI_ACP_TOOLS_*` map. Same single swap, so the rubric is
+ *  identical on every face that serves the tool. */
+export const BILI_COMPRESS_OPENAI_TOOLS = ACP_TOOLS_OPENAI.map((t) =>
+    t.function.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_OPENAI : t);
+
+/** Append the post-compaction continuation anchor to a compress tool result.
+ *  Successful folds only: a rejected call changed nothing, so there is no
+ *  working state to continue from and its own failure text already says why. */
+export function withContinuationAnchor(result: string): string {
+    return result.includes("FAILED") ? result : result + CONTINUATION_ANCHOR_NOTE;
+}
+
 // #1179 CCR v2: host-side range-restore extension of decompress. Optional
 // startId/endId (mNNNNN refs) restore only the block's messages inside that
 // span instead of the whole block. Execution is gated on CCR being armed for
@@ -159,18 +217,18 @@ export const BILI_DECOMPRESS_TOOL_OPENAI = { type: "function" as const, function
 export const BILI_DECOMPRESS_TOOL_RESPONSES = { type: "function" as const, name: DECOMPRESS_TOOL_RESPONSES.name, description: DECOMPRESS_TOOL_RESPONSES.description, parameters: withRangeParams(DECOMPRESS_TOOL_RESPONSES.parameters) };
 export const BILI_DECOMPRESS_TOOL_GOOGLE = { name: DECOMPRESS_TOOL_GOOGLE.name, description: DECOMPRESS_TOOL_GOOGLE.description, parameters: withRangeParams(DECOMPRESS_TOOL_GOOGLE.parameters) };
 
-export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL : t));
-export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_OPENAI : t));
-export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
-export const BILI_ACP_TOOLS_GOOGLE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_GOOGLE : t));
+export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL : t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL : t));
+export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_OPENAI : t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_OPENAI : t));
+export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_RESPONSES : t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
+export const BILI_ACP_TOOLS_GOOGLE = ACP_TOOLS_GOOGLE.map((t) => (t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_GOOGLE : t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_GOOGLE : t));
 
 // #1712: no-range variants — identical except decompress lacks startId/endId.
 // Served where range restore cannot be armed so the advertised schema never
 // offers what execution will refuse (see the #1179 note above).
-export const BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t));
-export const BILI_ACP_TOOLS_OPENAI_NO_RANGE = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t));
-export const BILI_ACP_TOOLS_RESPONSES_NO_RANGE = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
-export const BILI_ACP_TOOLS_GOOGLE_NO_RANGE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t));
+export const BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL : t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t));
+export const BILI_ACP_TOOLS_OPENAI_NO_RANGE = ACP_TOOLS_OPENAI.map((t) => (t.function.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_OPENAI : t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t));
+export const BILI_ACP_TOOLS_RESPONSES_NO_RANGE = ACP_TOOLS_RESPONSES.map((t) => (t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_RESPONSES : t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
+export const BILI_ACP_TOOLS_GOOGLE_NO_RANGE = ACP_TOOLS_GOOGLE.map((t) => (t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_GOOGLE : t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t));
 export const BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
 export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
 
