@@ -1,0 +1,867 @@
+import { createInitialState, defaultConfig, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { createHash } from "node:crypto";
+import { log as loggerLog } from "./logger.js";
+import { getStore } from "./persist.js";
+import type { WireProtocol } from "./util.js";
+
+export type BlockView = { text: string; count: number };
+
+/** Original content of a compressed block, captured at compress time. `full`
+ *  (all original messages) is always stored. `one` (one-level: direct messages
+ *  + nested child summaries) is `null` when it is byte-identical to `full` —
+ *  always the case for leaf blocks, since nested children are deactivated at
+ *  creation and the one-level view skips inactive children — and is persisted
+ *  as a single copy in that case (#401: the duplicated copy was 50% of
+ *  blockContents bytes on disk). */
+export type BlockContent = {
+    one: BlockView | null;
+    full: BlockView;
+};
+
+/** One successful compress, recorded for #189 observability: correlating a
+ *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
+ *  context rewrite that preceded it. `shrinkRatio` is the fraction of the
+ *  pre-compress context removed by this compress; `foldPoint` is the start ref
+ *  of the earliest folded range (where the prefix structure rewrites). */
+export type LastCompressInfo = {
+    at: number;
+    shrinkRatio: number;
+    foldPoint: string;
+    blocks: number;
+    tokensCompressed: number;
+};
+
+/** Compact suffix for retry/error logs: the rewrite that may have triggered a
+ *  transient upstream rejection. Empty when no compress has been recorded. */
+export function lastCompressSuffix(info: LastCompressInfo | undefined): string {
+    if (!info) return "";
+    return ` [after compress: shrink ${Math.round(info.shrinkRatio * 100)}% foldPoint=${info.foldPoint} blocks=${info.blocks} ~${info.tokensCompressed}tok]`;
+}
+
+/** [#1343] Queued full-text retrieval. `injection` is the ephemeral carrier
+ *  (never persisted); ref/tokens/chars/queuedAt back the durable
+ *  undelivered-ledger + TTL + drop logging. Lifecycle: queued → attached →
+ *  delivered | dropped (see store.ts). */
+export type PendingRetrieval = {
+    ref: string;
+    tokens: number;
+    chars: number;
+    queuedAt: number;
+    injection: CoreMessage;
+    /** CCR acp_retrieve riders carry the delivery ledger/TTL/counters; other ephemeral carriers (e.g. range restore #1207) only ride along and are removed at the delivery outcome. */
+    ccr?: boolean;
+};
+
+export type Session = {
+    id: string;
+    /** Identity / descriptive metadata. Populated on first request. */
+    meta: {
+        /** Client wire protocol. Absent until the first request resolves it.
+         *  Captured at first request and persisted, so the on-disk filename can
+         *  be namespaced by protocol/provider (e.g.
+         *  sessions/anthropic/bailian_<hash>.json) and a human can tell
+         *  sessions apart at a glance. */
+        protocol?: WireProtocol;
+        /** Upstream origin URL this session routes to. */
+        upstreamOrigin?: string;
+        /** Human-readable conversation label (the affinity token), e.g.
+         *  "ses_abc123" from opencode's x-session-affinity, or a client-provided
+         *  id from codex's body.session_id. Pure conversation dimension — no
+         *  key or upstream — so it is safe to display. Empty/undefined if the
+         *  client sent none. */
+        label?: string;
+        /** Short human-readable title derived from the first user message
+         *  (truncated). Lets the web UI show "Fix auth bug" instead of a hash.
+         *  Set once on the first request that has a user message. */
+        title?: string;
+        /** Effective compress prompt pack for the most recent request
+         *  ("default" when none). Route/model can change it mid-session, so
+         *  this is stamped per request (latest wins) — persisted so post-hoc
+         *  forensics can tell which surface served the session without config
+         *  archaeology. */
+        activePack?: string;
+    };
+    /** Cumulative usage stats, summed across all requests. Each sample =
+     *  one upstream usage report. Persisted; survives restart. */
+    stats: {
+        requests: number;
+        /** Approximate tokens saved by compression (legacy/rough — kept for
+         *  backward compat with old session files, not shown in UI). */
+        tokensSaved: number;
+        /** Cumulative input (prompt) tokens billed by upstream. */
+        inputTokens: number;
+        /** Cumulative prompt-cache-hit tokens. */
+        cachedTokens: number;
+        /** Cumulative output (completion) tokens. */
+        outputTokens: number;
+        /** Number of upstream usage samples recorded. */
+        cacheSamples: number;
+        /** Last upstream-reported input_tokens for THIS session (single-turn,
+         *  overwritten each turn). Source of truth for tokenCount — never an
+         *  estimate. See onCacheUsage in compress-loop-*.ts. */
+        lastInputTokens: number;
+        /** #857: provenance of lastInputTokens. "usage" = last written by an
+         *  upstream usage report (or a value stated BY the upstream, e.g. a
+         *  parsed overflow window); "estimate" = last RAISED by a local
+         *  estimate (preflight fold write-back, #604 failure arming, weak-
+         *  overflow arming). Derivative adjustments (compress credits, fold
+         *  reclaims) preserve the existing flag. Absent on legacy session
+         *  files — evidence-grade consumers (upward window self-heal, #496
+         *  overflow-evidence gate, stale-limit retraction) treat absent as
+         *  untrusted. */
+        lastInputTokensSource?: "usage" | "estimate";
+        /** #1110: one-shot emergency ceiling armed by an upstream context-
+         *  overflow 400 (server.ts overflow handler) — live evidence this
+         *  session cannot exceed that size. Kept SEPARATE from lastInputTokens
+         *  (the nudge baseline): a healthy compressed host turn keeps that
+         *  baseline low, and feeding it into the side-request guard (#554)
+         *  clamped an unrelated in-process caller's fixed-size request to a
+         *  permanent 413. The guard reads THIS only. Cleared by the next real
+         *  usage report (one-shot, per the #554 contract) and on compression
+         *  reset. Absent on legacy session files → treated as no arm. */
+        overflowArmTokens?: number;
+        /** Tokens compressed THIS turn whose fold has not yet materialized in
+         *  an upstream usage report (the post-compress re-request re-sends the
+         *  UNFOLDED history for prefix-cache reasons, so its usage report
+         *  over-reports). Usage recorders net this credit out of
+         *  lastInputTokens; the next prepare() — where the fold actually
+         *  happens — clears it. In-memory only. */
+        compressCreditTokens: number;
+        /** True from compress execution until the next upstream usage report
+         *  lands — marks THE request whose prompt first materialized the fold
+         *  (the one whose prefix-cache hit is expected to cliff). #695. */
+        pendingFoldUsage?: boolean;
+        /** Current in-context (uncompressed) token count at last processTurn. */
+        contextTokens: number;
+        /** #728: char-count upper bound of the LAST turn's outbound payload
+         *  (post-fold processed messages + system/tools overhead + images),
+         *  recorded locally in prepare* each turn. Read ONLY while
+         *  lastInputTokens == 0, as the fallback tokenCount for upstreams
+         *  that never report usage (ChatGPT-login-style backends — see
+         *  effectiveTokenCount in server.ts). Self-correcting: a successful
+         *  fold shrinks the next turn's payload and thus the estimate.
+         *  Cleared by resetSessionCompression (native-compaction boundary).
+         *  Persisted (survives restart like the rest of stats). */
+        localInputEstimate?: number;
+        /** #1569: last netted input value written by a REAL upstream usage
+         *  report (the arming paths never touch it — they only pose as
+         *  usage-grade for lastInputTokens). While > 0, effectiveTokenCount
+         *  sizes nudges on the calibrated CJK-aware estimate of the CURRENT
+         *  view instead of the char-count upper bound: the anchor's own
+         *  billing proves the optimistic rate holds for this session's
+         *  content class, while the upper bound over-counts code/JSON-heavy
+         *  payloads ~3.5× and lit spurious nudge bands during estimate-grade
+         *  turns. Never-reporting upstreams keep the fail-closed upper-bound
+         *  behavior (#553/#728) — their anchor stays absent. Dropped with the
+         *  other baseline stats at native-compaction boundaries. Absent on
+         *  legacy session files → legacy path. */
+        lastUsageGradeTokens?: number;
+        /** #1097 content store: total acp_retrieve calls issued this session. */
+        retrieveCalls: number;
+        /** #1097: acp_retrieve calls that resolved to stored content. */
+        retrieveHits: number;
+        /** #1097: acp_retrieve calls that missed (unknown/hallucinated ref). */
+        retrieveMisses: number;
+        /** #1343: acked retrieves whose full text was DROPPED undelivered
+         *  (post-drain upstream failure, disarm, TTL expiry, proxy restart). */
+        retrieveDropped?: number;
+        /** #1343: acked retrieves whose full text was confirmed delivered upstream. */
+        retrieveDelivered?: number;
+        /** #1097: cumulative bytes of unique originals held in the store. */
+        storedBytes: number;
+        /** #1097: cumulative wire bytes saved by placeholder substitution. */
+        storeBytesSaved: number;
+        /** #1095: image blocks downscaled this session (lifetime; optional —
+         *  absent in pre-#1095 records). */
+        imageShrunkCount?: number;
+        /** #1095: cumulative wire bytes saved by downscaling. */
+        imageBytesSaved?: number;
+        /** #1095: cumulative estimated visual tokens saved by downscaling. */
+        imageTokensSaved?: number;
+        /** #1095: total image_full tool calls issued. */
+        imageFullCalls?: number;
+        /** #1095: image_full calls that restored a downscaled ref. */
+        imageFullRestores?: number;
+        /** #1179 CCR v2: range-level decompress restores served (ephemeral channel). */
+        rangeRestores: number;
+        /** #1336: whole-block decompress restores served. Optional — absent in
+         *  pre-#1336 records. */
+        wholeBlockRestores?: number;
+        /** #1336: of those, how many had a cheaper precise path available at
+         *  restore time (the block carried covered refs AND CCR was armed, so
+         *  a range-restore / targeted retrieve would have sufficed). The
+         *  ratio is the retrieve-quality proxy for plan-aware retrieval. */
+        wholeBlockRestoresPreciseAvailable?: number;
+    };
+    /** Free-form escape hatch for future fields not yet promoted to typed
+     *  members. Persisted as-is (must be JSON-serializable). Use sparingly —
+     *  prefer promoting a stable field into `meta` or `stats` once it's clear. */
+    metadata: Record<string, unknown>;
+    state: CompressionState;
+    createdAt: number;
+    lastSeen: number;
+    /** Original content of compressed blocks, captured at compress time when
+     *  the source messages are still present in the request. decompress reads
+     *  from here instead of scanning ctx.messages (which only holds the
+     *  post-compression / folded view and loses originals across rounds).
+     *  Two views are cached — `one` (one-level: direct messages + nested
+     *  child summaries) and `full` (all original messages), matching the
+     *  collectBlockContent full flag semantics — but when the views are
+     *  byte-identical (leaf blocks) only one copy is kept (`one: null`,
+     *  #401).
+     *  Unbounded in memory by design — block summaries are small relative to
+     *  the history they replace, and disk persistence keeps the source of
+     *  truth; the MAX_SESSIONS cap bounds the number of concurrent sessions
+     *  in memory. See persist.ts. */
+    blockContents: Map<string, BlockContent>;
+    /** Latest full conversation snapshot, taken from the client's raw request
+     *  each turn (originalMessages). The client is the source of truth and
+     *  sends its complete history every request, so overwriting this per
+     *  request keeps a bounded, up-to-date copy — that is what makes offline
+     *  export complete. Bounded by MAX_SESSIONS, same as blockContents. */
+    lastMessages?: CoreMessage[];
+    /** True when lastMessages holds an already-pruned folded-view snapshot
+     *  (restored from disk — #401: the persisted record stores the bounded
+     *  folded view, not the raw history). Export must render it as-is instead
+     *  of re-running prune() (the snapshot's message ids no longer align with
+     *  the state ranges). Cleared by snapshotMessages on the next live
+     *  request — the client re-sends full raw history, restoring the invariant. */
+    lastMessagesFolded?: boolean;
+    /** Kernel CCR envelope (#1097): originals of ID-referenced tool results,
+    *  owned and mutated only by kernel processTurn (ccr-store node) via
+    *  adoptContentStore. Lazily loaded from the session's content-store.json;
+    *  NOT part of session.state (separate file, separate lifecycle — reset on
+    *  full-state rebase). In-memory only here; buildRecord omits it. */
+    contentStore?: MessageContentStore;
+    /** In-memory only (NOT persisted): content-store.json is rewritten only
+     *  while this is set (adopt grew entries / reset cleared the store). */
+    contentStoreDirty?: boolean;
+    /** #1336 in-memory only (NOT persisted — buildRecord omits it): acp_retrieve
+     *  hit count per ref, used by plan-aware search steering to flag refs the
+     *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart
+     *  (advisory signal only). */
+    retrieveCountsByRef?: Map<string, number>;
+    /** In-memory only (NOT persisted): request-only injections riding the
+     *  nudge channel. Since the GHSA jc6g v2 rework, acp_retrieve delivers its
+     *  full text in the tool result itself — this carrier now only serves
+     *  non-CCR riders (#1207 range restore, ccr:false). Legacy sessions from
+     *  before the rework may still carry ccr:true entries; the reconcile/
+     *  commit/drop machinery below handles them (they are never re-created). */
+    pendingRetrievals: PendingRetrieval[];
+    /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
+     *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
+     *  must yield identical wire bytes across turns/restarts (prefix-cache
+     *  invariant), so this is a pure CPU cache, never a correctness source. */
+    imageEncodeCache?: Map<string, { b64: string; mediaType: string }>;
+    /** #1095 in-memory only (NOT persisted): sha256 fingerprints of the
+     *  original payloads shrunk per ref — lets image_full invalidate the exact
+     *  encode-cache entries a restored ref contributed. */
+    imageFingerprintsByRef?: Map<string, string[]>;
+    /** Number of in-flight requests using this session. A session with
+     *  inFlight > 0 must NOT be LRU-evicted: evicting it mid-stream flushes a
+     *  half-mutated snapshot and then a miss reloads a SECOND Session object,
+     *  causing split-brain writes to the same file. See persist.ts M5. */
+    inFlight: number;
+    /** False until the first successful write to disk. evictOldest will not
+     *  drop a never-persisted session on flush failure (that would be a
+     *  permanent loss). */
+    persisted: boolean;
+    /** In-memory only (NOT persisted — buildRecord omits it): true while the
+     *  session was restored from disk and has seen no request in THIS process
+     *  (#404). Restored sessions carry their on-disk savedAt as lastSeen (not
+     *  Date.now()), so consumers can tell boot-restore staleness from real
+     *  activity; fallback=latest skips restored sessions rather than guessing
+     *  among a readdir-order tie. Cleared on the first real request touch. */
+    restored?: boolean;
+    /** In-memory only (NOT persisted): one-shot set by persist's load (#1343).
+     *  getSession() clears `restored` on the first request touch, but
+     *  reconcileReloadedRetrievals runs LATER in that same request — so it
+     *  keys off this flag, which survives until the reconcile (or a full
+     *  reset) has actually run. */
+    ccrReconcilePending?: boolean;
+    /** In-memory only (NOT persisted — buildRecord omits it): the most recent
+     *  successful compress, set by applyRanges and read by the replay/preflight
+     *  retry callbacks to correlate a transient upstream rejection with the
+     *  rewrite that preceded it (#189). A fresh process has none. */
+    lastCompress?: LastCompressInfo;
+    /** Promise chain for per-session serialization. Two concurrent requests
+     *  sharing a session id would interleave processTurn / stream-rewriter
+     *  mutations on session.state, corrupting it. withSessionLock chains each
+     *  critical section onto the previous one so they run strictly in order. */
+    lockChain?: Promise<unknown>;
+};
+
+// #833: wire paths resolve the kernel Config per request (global → provider →
+// model compress settings + self-heal + output headroom), while the plugin
+// status/tool API reads sessions with no request context and was falling back
+// to the base kernelConfig — which carries NO file/provider/model compress
+// settings — so the panel Nudge line showed kernel defaults regardless of user
+// config. Same pattern as absorb.ts's effectiveAbsorb: stamp the last resolved
+// Config per session (latest wins), read it with fallback to the base.
+export function storeEffectiveConfig(session: Session, config: Config): void {
+    session.metadata["effectiveConfig"] = config;
+}
+
+export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
+    const stored = session?.metadata["effectiveConfig"];
+    if (stored && typeof stored === "object") return { ...fallback, ...(stored as Partial<Config>) };
+    return fallback;
+}
+
+/** Mirror of acp-kernel's resolveAdaptiveGrowth (not exported by the kernel):
+ *  min(growthCap, max(growthFloor, round(modelContextLimit × growthRatio))).
+ *  The per-request config stamped by storeEffectiveConfig is the same object
+ *  the kernel decided with this turn, so the margin matches the kernel's own
+ *  cadence exactly — including owner-flattened compress.nudgeGrowthTokens. */
+function nudgeGrowthInterval(config?: Config): number {
+    const c = config ?? defaultConfig(1);
+    return Math.min(c.nudge.growthCap, Math.max(c.nudge.growthFloor, Math.round(c.modelContextLimit * c.nudge.growthRatio)));
+}
+
+/** #1595: retire a stale-high kernel nudge reference when a REAL usage-grade
+ *  sample lands far below it.
+ *
+ * The kernel's own downward re-anchor (nudgeNode) compares the incoming token
+ * count against the BASELINE only, but its growth decision prefers
+ * lastNudgeShownTokens whenever that is non-zero. When an estimate-grade
+ * reading (armFailureShrink window feeding effectiveTokenCount's #1492
+ * fall-through) pins lastNudgeShownTokens at a phantom-high level and real
+ * usage then settles within one interval of the low baseline, the kernel never
+ * self-resets and every later growth calculation runs against the phantom —
+ * permanently negative, blocking the tier cadence until context regrows past
+ * the phantom level or a compression resets the references.
+ *
+ * Called from every usage-grade settle site (plugin SSE pipes via
+ * applyUsageSample, proxy streaming loops via recordUsage, non-streaming JSON)
+ * AFTER lastInputTokens has been written from the real report. Fires only for
+ * drops of more than one full growth interval below the current reference
+ * (lastNudgeShownTokens, else baseline) — estimates never trigger it. On fire
+ * it mirrors the kernel's drift-reset trio: baseline := real value,
+ * lastNudgeShownTokens := 0, lastShownByTier := {} — so the next prepare
+ * measures growth from reality with a full interval of cadence headroom. */
+export function reanchorNudgeOnUsageDrop(session: Session): void {
+    // Partial-session literals (test fixtures, pre-kernel shapes) may lack
+    // state/stats fields entirely — no-op rather than crash.
+    const nudge = session.state?.nudge;
+    const value = session.stats.lastInputTokens;
+    if (!nudge || typeof value !== "number" || value <= 0) return;
+    const ref = nudge.lastNudgeShownTokens > 0 ? nudge.lastNudgeShownTokens : nudge.lastPerMessageNudgeTokens;
+    if (ref <= 0) return;
+    const stored = session.metadata?.["effectiveConfig"];
+    const margin = nudgeGrowthInterval(stored && typeof stored === "object" ? (stored as Config) : undefined);
+    if (!(value < ref - margin)) return;
+    nudge.lastPerMessageNudgeTokens = value;
+    nudge.lastNudgeShownTokens = 0;
+    nudge.lastShownByTier = {};
+    markDirty(session);
+    loggerLog("info", `[${session.id}] nudge reference re-anchored ${ref} -> ${value} after usage-grade drop (margin ${margin}) — stale high reference retired (#1595)`);
+}
+
+/** #1595: name the third no-usage shape — an upstream SUCCESS that completes
+ *  without reporting input usage. Transport failures and upstream 5xx already
+ *  log their own armFailureShrink arms; this one used to be silent, so a
+ *  session could sit on stale values with nothing in the log explaining why.
+ *  Callers gate the preconditions (clean terminal / parsed body + no input
+ *  sample accumulated); this handles the once-per-session throttle. */
+export function diagnoseSuccessWithoutUsage(session: Session, wire: string): void {
+    // Partial-session literals (test fixtures) may lack the metadata bag —
+    // nothing to throttle against, so skip rather than crash.
+    if (!session.metadata) return;
+    if (session.metadata["warnedNoUsage"]) return;
+    session.metadata["warnedNoUsage"] = true;
+    markDirty(session);
+    loggerLog("warn", `[${session.id}] [${wire}] upstream success without usage report — keeping lastInputTokens=${session.stats.lastInputTokens} (source=${session.stats.lastInputTokensSource ?? "none"}); nudge decisions ride local estimates until a usage-grade sample lands (#1595)`);
+}
+
+const sessions = new Map<string, Session>();
+
+// `|| 256` only catches falsy (0/NaN); Math.max(1, ...) also rejects negatives.
+let MAX_SESSIONS = Math.max(1, Number.parseInt(process.env.BILI_MAX_SESSIONS ?? "256", 10) || 256);
+
+let initialized = false;
+
+/** Bulk-load persisted sessions from disk into the in-memory map. Called once
+ *  at server startup before listening. boot() does ONE loadAll pass plus the
+ *  #286 migration over the same parsed map (#401: the
+ *  old migrateLegacyIds()+loadAll() pair walked and parsed the tree twice).
+ *  Caps at MAX_SESSIONS by the most recently active of createdAt/lastSeen-
+ *  from-disk (keeps the freshest; a session that is old but was active until
+ *  recently must not lose its slot to a newer-created-but-idle one, #404) so
+ *  a huge backlog cannot OOM on boot. Idempotent. */
+export async function initSessions(): Promise<void> {
+    if (initialized) return;
+    initialized = true;
+    const store = getStore();
+    if (!store.enabled) return;
+    const loaded = await store.boot();
+    if (loaded.size > MAX_SESSIONS) {
+        const freshness = (s: Session) => Math.max(s.createdAt ?? 0, s.lastSeen ?? 0);
+        const entries = [...loaded.entries()].sort((a, b) => freshness(b[1]) - freshness(a[1]));
+        for (const [id, s] of entries) {
+            if (sessions.size >= MAX_SESSIONS) break;
+            sessions.set(id, s);
+        }
+    } else {
+        for (const [id, s] of loaded) sessions.set(id, s);
+    }
+}
+
+export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
+    const existing = sessions.get(id);
+    if (existing) {
+        existing.lastSeen = Date.now();
+        existing.restored = false;
+        // Fill in protocol/upstream/label meta on an existing session if the caller
+        // now knows it (e.g. a session was created by loadAll without meta).
+        if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
+        if (meta?.upstreamOrigin && !existing.meta.upstreamOrigin) existing.meta.upstreamOrigin = meta.upstreamOrigin;
+        if (meta?.label && !existing.meta.label) existing.meta.label = meta.label;
+        return existing;
+    }
+    // Memory miss: try reload from disk (e.g. after LRU eviction).
+    const store = getStore();
+    const reloaded = store.loadSync(id, meta);
+    if (reloaded) {
+        // A memory-miss reload is triggered by a real request: stamp fresh
+        // activity, not the restored-from-disk state (#404).
+        reloaded.lastSeen = Date.now();
+        reloaded.restored = false;
+        reloaded.persisted = true;
+        // A memory-miss reload puts a NEW resident entry back into the pool; the
+        // new-session cap guard below is unreachable on this path, so enforce it
+        // here or evict-then-revisit grows the pool past MAX_SESSIONS (#1064).
+        if (sessions.size >= MAX_SESSIONS) {
+            const evicted = evictOldest();
+            if (!evicted) {
+                throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; all in-flight)`);
+            }
+        }
+        sessions.set(id, reloaded);
+        return reloaded;
+    }
+    if (sessions.size >= MAX_SESSIONS) {
+        const evicted = evictOldest();
+        if (!evicted) {
+            throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; all in-flight)`);
+        }
+    }
+    const session: Session = {
+        id,
+        meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        metadata: {},
+        state: createInitialState(),
+        createdAt: Date.now(),
+        lastSeen: Date.now(),
+        blockContents: new Map(),
+        inFlight: 0,
+        persisted: false,
+        pendingRetrievals: [],
+    };
+    sessions.set(id, session);
+    return session;
+}
+
+/** Mark a session as in-use by a request. Must be paired with releaseInFlight.
+ *  Prevents LRU eviction of a session mid-stream. */
+export function acquireInFlight(session: Session): void {
+    session.inFlight++;
+}
+
+/** Release an in-use marker. Decrements; the session becomes evictable again. */
+export function releaseInFlight(session: Session): void {
+    if (session.inFlight > 0) session.inFlight--;
+}
+
+/** Total in-flight requests across all sessions (sum of per-session
+ *  counters). The self-restart gate (#811) requires this to be zero. */
+export function totalInFlight(): number {
+    let n = 0;
+    for (const s of sessions.values()) n += s.inFlight;
+    return n;
+}
+
+/** Serialize a critical section per session. Each call chains onto the
+ *  previous lockChain, so concurrent requests for the same session execute
+ *  strictly one-at-a-time. This prevents two processTurn / stream-rewriter
+ *  invocations from interleaving mutations on session.state.
+ *
+ *  For single-agent workflows (the common case) there is no contention and
+ *  the chain resolves immediately. The cost is one Promise allocation. */
+export async function withSessionLock<T>(session: Session, fn: () => T | Promise<T>): Promise<T> {
+    const prev = session.lockChain ?? Promise.resolve();
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => { release = resolve; });
+    session.lockChain = prev.then(() => done);
+    await prev;
+    try {
+        return await fn();
+    } finally {
+        release();
+    }
+}
+
+export function listSessions(): Session[] {
+    return [...sessions.values()].sort((a, b) => b.lastSeen - a.lastSeen);
+}
+
+/** Read-only in-memory lookup. Unlike getSession, never creates or reloads a
+ *  session — used by the plugin tool API, which must not conjure state for a
+ *  conversation it has never seen. */
+export function peekSession(id: string): Session | undefined {
+    return sessions.get(id);
+}
+
+// #1086: does THIS instance hold processed compression state for the given
+// conversation? Memory first, then the persisted record (covers the
+// auto-update restart: memory is gone, disk state survives). A bili instance
+// only ever creates a session record when it PROCESSED the request, so
+// "record exists" ⇒ "the ACP artifacts this client re-sends are ours" — the
+// exemption the chain-detection content fallback needs before passing a
+// request through verbatim. Read-only: never mutates the session map.
+export function hasProcessedState(id: string, meta?: { protocol?: string }): boolean {
+    const mem = sessions.get(id);
+    if (mem) return processedEvidence(mem);
+    const store = getStore();
+    if (!store.enabled) return false;
+    const reloaded = store.loadSync(id, meta);
+    return reloaded !== null && processedEvidence(reloaded);
+}
+
+function processedEvidence(s: Session): boolean {
+    return s.stats.requests > 0 || s.state.nextBlockId > 1 || s.blockContents.size > 0;
+}
+
+/** #1082 GC: remove a session from the in-memory map so its debounced writer
+ *  cannot resurrect the file GC just deleted. Caller must have verified the
+ *  session is idle (no in-flight requests, no pending save, lastSeen not newer
+ *  than the on-disk record). Returns false when absent or busy. */
+export function dropSessionForGc(id: string): boolean {
+    const s = sessions.get(id);
+    if (!s || s.inFlight > 0) return false;
+    sessions.delete(id);
+    return true;
+}
+
+// #760b: unified canonical session id. Every session exposes a stable pfa-* id
+// that MCP tools route by, independent of what the client calls itself.
+// Anonymous sessions already ARE pfa-* (PFA-minted session.id), so their
+// canonical id is session.id itself. Legacy (client-id) sessions derive a
+// stable pfa-* from their session id — deterministic, so the value survives even
+// if the persisted copy is lost. It is materialized onto metadata.canonicalId
+// (persisted) on first use so lookups are cheap and the value is inspectable.
+function derivedLegacyCanonicalId(sessionId: string): string {
+    return `pfa-${createHash("sha256").update(`legacy:${sessionId}`).digest("hex").slice(0, 16)}`;
+}
+
+/** Pure: the session's canonical id (always pfa-*). Never mutates. */
+function canonicalIdOf(session: Session): string {
+    if (session.id.startsWith("pfa-")) return session.id;
+    const c = session.metadata.canonicalId;
+    if (typeof c === "string" && c.length > 0) return c;
+    return derivedLegacyCanonicalId(session.id);
+}
+
+/** Materialize + persist the session's canonical id (idempotent) and return it.
+ *  Called where the id is surfaced to the model (wire notes) so the exact value
+ *  shown is the one persisted and routable. Anonymous sessions are a no-op
+ *  (canonical id already equals session.id). */
+export function ensureCanonicalId(session: Session): string {
+    const id = canonicalIdOf(session);
+    if (!session.id.startsWith("pfa-") && session.metadata.canonicalId !== id) {
+        session.metadata.canonicalId = id;
+        markDirty(session);
+    }
+    return id;
+}
+
+/** Read-only reverse lookup: the resident session whose canonical id matches.
+ *  Scans the in-memory pool (≤ MAX_SESSIONS); always consistent with the live
+ *  session set — no separate index to desync on evict/load. */
+export function findSessionByCanonicalId(canonicalId: string): Session | undefined {
+    for (const s of sessions.values()) {
+        if (canonicalIdOf(s) === canonicalId) return s;
+    }
+    return undefined;
+}
+
+/** Overwrite the session's full-conversation snapshot with the latest client
+ *  raw request messages (originalMessages from prepare*). One array per
+ *  session, replaced every request — bounded, always the newest state. Empty
+ *  arrays (parse failures) never clobber a good snapshot. */
+export function snapshotMessages(session: Session, messages: CoreMessage[]): void {
+    if (messages.length > 0) {
+        session.lastMessages = messages;
+        session.lastMessagesFolded = false;
+    }
+}
+
+/** Mark a session's state as changed so it is persisted on the next debounce.
+ *  Call this after any mutation (processTurn, compress, decompress, orphan GC). */
+export function markDirty(session: Session): void {
+    getStore().scheduleSave(session);
+}
+
+/** Record original block content at compress time. */
+export function cacheBlockContent(session: Session, blockId: string, content: BlockContent): void {
+    session.blockContents.set(blockId, content);
+}
+
+export function resetSessionCompression(session: Session): void {
+    // Kernel contract (acp-kernel image-compress.d.ts): resetImageFullState on
+    // EVERY state reset — refs are re-issued here, so any surviving
+    // imageFullRestored/imageShrinks entries would misattribute.
+    session.state = resetImageFullState(createInitialState());
+    session.blockContents.clear();
+    // The kernel contract ties the store to the state ('host resets the store
+    // with the state'): a full rebase restarts refs at m00001, so old entries
+    // would misattribute under reused numbers. contentStoreDirty + markDirty
+    // deletes the on-disk envelope on the next save.
+    session.contentStore = undefined;
+    session.contentStoreDirty = true;
+    // #1343: rebase wipes both the queued injections and their acks (context
+    // rebuilt), so clear the durable ledger too — otherwise a later
+    // reconcileReloadedRetrievals would misattribute this expected loss as a
+    // proxy-restart drop.
+    session.pendingRetrievals.length = 0;
+    delete session.metadata.ccrUndelivered;
+    delete session.metadata.ccrDropNotes;
+    session.ccrReconcilePending = false;
+    // #1095: same ref-reissue rationale as the content store — encode-cache /
+    // fingerprint entries keyed by old refs would misattribute after rebase.
+    session.imageEncodeCache?.clear();
+    session.imageFingerprintsByRef?.clear();
+    session.stats.lastInputTokens = 0;
+    // #857: a zeroed baseline carries no provenance — drop any stale flag.
+    delete session.stats.lastInputTokensSource;
+    // #1110: the conversation was rebuilt — a pre-compaction overflow arm no
+    // longer bounds this session; drop it so the guard falls back to the
+    // declared window instead of clamping to a stale ceiling.
+    delete session.stats.overflowArmTokens;
+    // #728: the pre-compaction outbound payload is gone — the old estimate
+    // (measured against the pre-compaction wire) would read high and blind
+    // the nudge fallback early; let the next prepare* re-measure.
+    session.stats.localInputEstimate = 0;
+    // #1569: pre-compaction billing evidence describes a payload lineage that
+    // no longer exists — fall back to legacy sizing until a fresh report lands.
+    delete session.stats.lastUsageGradeTokens;
+    session.stats.contextTokens = 0;
+    session.metadata.nativeCompactionAt = Date.now();
+    markDirty(session);
+}
+
+export function markNativeCompactionBoundary(session: Session): void {
+    session.metadata.nativeCompactionBoundary = {
+        at: Date.now(),
+        pendingRebase: true,
+    };
+    markDirty(session);
+}
+
+export function reconcileNativeCompactionBoundary(session: Session): boolean {
+    const boundary = session.metadata.nativeCompactionBoundary;
+    if (!boundary || typeof boundary !== "object" || !(boundary as Record<string, unknown>).pendingRebase) {
+        return false;
+    }
+    resetSessionCompression(session);
+    session.metadata.nativeCompactionBoundary = {
+        ...(boundary as Record<string, unknown>),
+        pendingRebase: false,
+        rebasedAt: Date.now(),
+    };
+    markDirty(session);
+    return true;
+}
+
+/** Mark a client-side native compaction (omp /compact on the anthropic wire).
+ *  The sid does NOT rotate on in-session compaction, so the per-sid registry
+ *  reuses the same key with stale state. Consumed by the NEXT processTurn via
+ *  applyCompactionArchive (#395). Distinct from nativeCompactionBoundary
+ *  (Responses/codex, which rebases by resetting state). */
+export function markCompactionBoundary(session: Session): void {
+    session.metadata.compactionBoundary = {
+        at: Date.now(),
+        pending: true,
+    };
+    markDirty(session);
+}
+
+type PreCompactionArchive = Record<string, { at: number; reason: string }>;
+
+function readPreCompactionArchive(session: Session): PreCompactionArchive {
+    const raw = session.metadata.preCompactionArchive;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        return raw as PreCompactionArchive;
+    }
+    return {};
+}
+
+export function preCompactionArchiveOf(session: Session): PreCompactionArchive {
+    return readPreCompactionArchive(session);
+}
+
+// Must run AFTER the processTurn that followed markCompactionBoundary (so
+// syncBlocks has deactivated the blocks whose raw ids left the shortened
+// history). Blocks active in `activeBefore` but inactive now are archived;
+// byRaw/byRef are pruned to liveRawIds (stops the #390 additive leak).
+// nextIndex is left alone so a freed ref slot is never re-allocated onto a
+// retained tail's live tag.
+export function applyCompactionArchive(
+    session: Session,
+    activeBefore: Set<string>,
+    liveRawIds: Set<string>,
+    log: (level: string, msg: string) => void,
+): void {
+    const boundary = session.metadata.compactionBoundary;
+    if (!boundary || typeof boundary !== "object" || !(boundary as Record<string, unknown>).pending) {
+        return;
+    }
+    const activeAfter = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
+    const deactivated = [...activeBefore].filter((id) => !activeAfter.has(id));
+    if (deactivated.length > 0) {
+        const archive = readPreCompactionArchive(session);
+        const at = Date.now();
+        for (const id of deactivated) {
+            archive[id] = { at, reason: "content replaced by client native compaction summary" };
+        }
+        session.metadata.preCompactionArchive = archive;
+    }
+
+    const { byRaw, byRef } = session.state.messageRefs;
+    const prunedByRaw: Record<string, string> = {};
+    for (const [rawId, ref] of Object.entries(byRaw)) {
+        if (liveRawIds.has(rawId)) prunedByRaw[rawId] = ref;
+    }
+    const prunedByRef: Record<string, string> = {};
+    for (const [ref, rawId] of Object.entries(byRef)) {
+        if (liveRawIds.has(rawId)) prunedByRef[ref] = rawId;
+    }
+    session.state.messageRefs.byRaw = prunedByRaw;
+    session.state.messageRefs.byRef = prunedByRef;
+
+    session.metadata.compactionBoundary = {
+        ...(boundary as Record<string, unknown>),
+        pending: false,
+        archivedAt: Date.now(),
+        archivedBlocks: deactivated,
+    };
+    markDirty(session);
+    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${Object.keys(prunedByRaw).length} live raw id(s)`);
+}
+
+// #1001: clients rewrite session history SILENTLY mid-session (opencode native
+// compaction on model switch) with no /compact request for the announced-
+// boundary machinery to key off — mixed-generation ref maps then persist.
+// TIMING INVARIANT: callers must capture knownRefsBefore BEFORE processTurn —
+// post-turn every incoming id has a fresh ref and the ratio is always 1.0.
+// Append-only turns keep the ratio near 1.0; a rewrite collapses it. The gate
+// on prior compression history keeps fresh sessions / first replays out.
+const REWRITE_MIN_KNOWN_REFS = 20;
+const REWRITE_MAX_KNOWN_RATIO = 0.5;
+// #1075: clients stamp auxiliary side-requests (Claude Code WebSearch query
+// refinement, title generation, …) with the SAME session id but carry only a
+// handful of brand-new messages — 0/N < 0.5 trips the ratio gate, and the
+// archive+prune that follows wipes the whole ref map, so the next
+// full-history replay burns N fresh refs per side-request until m99999
+// exhausts. A genuine rewrite of a mature conversation never arrives as a
+// near-empty payload, and always shares at least one message id with the
+// prior history (clients keep a tail through compaction), so require both
+// before treating the shrink as real. Missing a genuine rewrite is cheap
+// (stale map entries linger until session end); a false positive is fatal.
+export const REWRITE_MIN_INCOMING_TOTAL = 10;
+
+export interface RewriteDetection {
+    detected: boolean;
+    knownBefore: number;
+    incomingTotal: number;
+    knownIncoming: number;
+}
+
+export function detectUnannouncedHistoryRewrite(
+    session: Session,
+    knownRefsBefore: ReadonlySet<string>,
+    liveRawIds: Iterable<string>,
+): RewriteDetection {
+    const knownBefore = knownRefsBefore.size;
+    let incomingTotal = 0;
+    let knownIncoming = 0;
+    for (const id of liveRawIds) {
+        incomingTotal++;
+        if (knownRefsBefore.has(id)) knownIncoming++;
+    }
+    const detected =
+        knownBefore >= REWRITE_MIN_KNOWN_REFS &&
+        session.state.blocks.length > 0 &&
+        incomingTotal >= REWRITE_MIN_INCOMING_TOTAL &&
+        knownIncoming > 0 &&
+        knownIncoming / incomingTotal < REWRITE_MAX_KNOWN_RATIO;
+    return { detected, knownBefore, incomingTotal, knownIncoming };
+}
+
+/** #1195: message ids are content hashes — if a client resends history whose
+ *  bytes changed (resume/re-serialization, edit, duplicate-cluster shift), the
+ *  ids of compressed-range messages no longer match the block's covered set,
+ *  and those messages silently re-enter the wire unfolded even though the
+ *  compress result already reported them as saved. Returns how many of the
+ *  covered ids are present in the resent history, or null when coverage is
+ *  complete (or nothing was covered). */
+export interface FoldCoverage {
+    expected: number;
+    matched: number;
+}
+
+export function foldCoverage(
+    coveredBefore: ReadonlySet<string>,
+    liveRawIds: Iterable<string>,
+): FoldCoverage | null {
+    if (coveredBefore.size === 0) return null;
+    const incoming = new Set(liveRawIds);
+    let matched = 0;
+    for (const id of coveredBefore) if (incoming.has(id)) matched++;
+    return matched < coveredBefore.size ? { expected: coveredBefore.size, matched } : null;
+}
+
+/** Flush a session to disk and drop it from memory (LRU eviction). Refuses to
+ *  evict sessions that are in-flight or whose flush failed (would lose a
+ *  never-persisted session permanently). Returns true if a slot was freed. */
+function evictOldest(): boolean {
+    let oldestId: string | undefined;
+    let oldestSeen = Infinity;
+    for (const [id, s] of sessions) {
+        // Never evict a session being actively mutated by a request — flushing
+        // its half-mutated state then reloading a second object causes
+        // split-brain writes to the same file.
+        if (s.inFlight > 0) continue;
+        if (s.lastSeen < oldestSeen) {
+            oldestSeen = s.lastSeen;
+            oldestId = id;
+        }
+    }
+    if (!oldestId) return false;
+    const s = sessions.get(oldestId)!;
+    const ok = getStore().flushSync(s);
+    if (!ok && !s.persisted) {
+        // Flush failed AND this session was never written to disk — evicting
+        // would permanently lose it. Keep it in memory instead.
+        return false;
+    }
+    sessions.delete(oldestId);
+    return true;
+}
+
+/** Graceful shutdown: flush all sessions with pending writes. */
+export async function flushAllSessions(): Promise<void> {
+    await getStore().flushAll(sessions.values());
+}
+
+export function _resetSessionsForTest(max?: number): void {
+    if (max !== undefined) MAX_SESSIONS = Math.max(1, Math.floor(max));
+    for (const s of sessions.values()) {
+        if (s.inFlight > 0) s.inFlight = 0;
+    }
+    sessions.clear();
+}
+
+export function _sessionsSizeForTest(): number {
+    return sessions.size;
+}

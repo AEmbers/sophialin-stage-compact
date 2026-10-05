@@ -1,0 +1,14 @@
+node_modules
+# NOTE: dist/ is intentionally COMMITTED (see package.json "files").
+# `github:` installs fetch the repository, and pnpm filters the installed tree
+# by "files" — so without a committed dist, and with no prepare script to build
+# one, every declared entry (main + all five exports) points at a missing
+# artifact and DSH's plugin market reports the package as `broken`.
+# Committing dist keeps repository installs working with no build step and no
+# pnpm "allowBuilds" entry. Rebuild before committing: npm run build.
+*.log
+.env
+*.tgz
+.bili-coop-build-stamp
+tmp/
+tests/.pp-stamp-state-*/

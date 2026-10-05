@@ -1,0 +1,562 @@
+import type { CoreMessage } from "acp-kernel";
+import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
+import { buildVisibilityMarker } from "./core.js";
+import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { degenerateTurnWarning } from "../degenerate-turn.js";
+import { log as loggerLog } from "../logger.js";
+import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
+
+import type {
+    CompressLoopAdapter,
+    EmitCompletionOpts,
+    ParsedStreamEvent,
+    ToolCallEmit,
+} from "./core.js";
+
+const PROXY_TOOL_SET = new Set([
+    "compress", "decompress", "search_context", "acp_status",
+    "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
+]);
+
+// Given a raw SSE chunk that carries tool_call fragments, decide how to
+// replay it for a real-tool round: "keep" = every fragment belongs to a real
+// call (forward verbatim), null = nothing real in it (drop), or a rewritten
+// copy keeping only the real fragments (mixed chunk).
+function filterRealToolFragments(
+    parsed: Record<string, unknown>,
+    realIndexes: Set<number>,
+): "keep" | null | Record<string, unknown> {
+    const choices = parsed.choices as Array<Record<string, unknown>> | undefined;
+    const choice = choices?.[0];
+    const delta = choice?.delta as Record<string, unknown> | undefined;
+    const tcs = delta?.tool_calls as Array<Record<string, unknown>> | undefined;
+    if (!tcs || tcs.length === 0) return "keep";
+    let anyReal = false;
+    let anyProxy = false;
+    for (const tc of tcs) {
+        const idx = typeof tc.index === "number" ? tc.index : 0;
+        if (realIndexes.has(idx)) anyReal = true;
+        else anyProxy = true;
+    }
+    if (!anyProxy) return "keep";
+    if (!anyReal) return null;
+    const filtered: Record<string, unknown> = { ...parsed };
+    const filteredChoices: Array<Record<string, unknown>> = [...(choices as Array<Record<string, unknown>>)];
+    const filteredChoice: Record<string, unknown> = { ...(choice as Record<string, unknown>) };
+    const filteredDelta: Record<string, unknown> = { ...(delta as Record<string, unknown>) };
+    filteredDelta.tool_calls = tcs.filter((tc) => realIndexes.has(typeof tc.index === "number" ? tc.index : 0));
+    filteredChoice.delta = filteredDelta;
+    filteredChoices[0] = filteredChoice;
+    filtered.choices = filteredChoices;
+    return filtered;
+}
+
+interface ToolCallBuffer {
+    index: number;
+    id: string;
+    name: string;
+    arguments: string;
+    frags: number;
+    /** Set on first fragment: did THAT fragment carry the (first part of) the name? */
+    nameInFirst?: boolean;
+}
+
+async function* iterSseChunks(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+        while (true) {
+            let done: boolean;
+            let value: Uint8Array | undefined;
+            try {
+                ({ done, value } = await reader.read());
+            } catch {
+                break;
+            }
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            buf = buf.replace(/\r\n|\r/g, "\n");
+            let idx: number;
+            while ((idx = buf.indexOf("\n\n")) >= 0) {
+                const raw = buf.slice(0, idx);
+                buf = buf.slice(idx + 2);
+                if (raw.trim().length > 0) yield raw;
+            }
+        }
+        if (buf.trim().length > 0) yield buf;
+    } finally {
+        reader.releaseLock();
+    }
+}
+
+function rewriteContentChunk(parsed: Record<string, unknown>, content: string): Buffer {
+    const clone = { ...parsed } as { choices?: Array<Record<string, unknown>> };
+    if (clone.choices && clone.choices.length > 0) {
+        const choice = { ...(clone.choices[0] as Record<string, unknown>) };
+        const delta = { ...(choice.delta as Record<string, unknown>) };
+        delta.content = content;
+        choice.delta = delta;
+        clone.choices = [choice, ...clone.choices.slice(1)];
+    }
+    return Buffer.from(`data: ${JSON.stringify(clone)}\n\n`, "utf8");
+}
+
+// A chunk forwarded verbatim must never carry finish_reason: the ACP loop may run
+// another upstream round after this one (core.ts reRequest), and the completion is
+// emitted once, at the end, by emitCompletion. Leaking an early finish makes every
+// later token "content after the finish reason" to the client.
+function stripFinishReasonChunk(buf: Buffer): Buffer {
+    const m = /^data: (.*)\n\n$/s.exec(buf.toString("utf8"));
+    if (!m) return buf;
+    try {
+        const parsed = JSON.parse(m[1]) as { choices?: Array<Record<string, unknown>> };
+        if (!Array.isArray(parsed.choices)) return buf;
+        parsed.choices = parsed.choices.map((c) => ({ ...c, finish_reason: null }));
+        return Buffer.from(`data: ${JSON.stringify(parsed)}\n\n`, "utf8");
+    } catch {
+        return buf;
+    }
+}
+
+// OpenAI-wire upstreams disagree on where the cached-prompt count lives: the
+// standard field is prompt_tokens_details.cached_tokens, while DeepSeek reports
+// KV-cache hits as top-level prompt_cache_hit_tokens (#779). Both mean "input
+// tokens served from cache", so normalize to one number.
+function openaiCachedTokens(u: Record<string, unknown>): number | undefined {
+    const pd = u.prompt_tokens_details as Record<string, unknown> | undefined;
+    if (typeof pd?.cached_tokens === "number") return pd.cached_tokens;
+    if (typeof u.prompt_cache_hit_tokens === "number") return u.prompt_cache_hit_tokens;
+    return undefined;
+}
+
+export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string, notes?: string[], errorShape: "protocol" | "completion" = "protocol"): CompressLoopAdapter {
+    const model = (requestBody.model as string) ?? "unknown";
+    let responseId = `chatcmpl-proxy-${Date.now()}`;
+    let toolIndex = 0;
+
+    const makeBase = () => ({
+        id: responseId,
+        object: "chat.completion.chunk" as const,
+        created: Date.now(),
+        model,
+    });
+
+    const buildContent = (content: string): Buffer =>
+        Buffer.from(
+            `data: ${JSON.stringify({
+                id: responseId,
+                object: "chat.completion.chunk",
+                created: Date.now(),
+                model,
+                choices: [{ index: 0, delta: { content }, finish_reason: null }],
+            })}\n\n`,
+            "utf8",
+        );
+
+    const buildReasoning = (content: string): Buffer =>
+        Buffer.from(
+            `data: ${JSON.stringify({
+                id: responseId,
+                object: "chat.completion.chunk",
+                created: Date.now(),
+                model,
+                choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }],
+            })}\n\n`,
+            "utf8",
+        );
+
+    const buildToolCall = (call: ToolCallEmit): Buffer => {
+        const idx = toolIndex++;
+        return Buffer.from(
+            `data: ${JSON.stringify({
+                ...makeBase(),
+                choices: [{
+                    index: 0,
+                    delta: {
+                        tool_calls: [{
+                            index: idx,
+                            id: call.callId,
+                            type: "function",
+                            function: { name: call.name, arguments: call.arguments },
+                        }],
+                    },
+                    finish_reason: null,
+                }],
+            })}\n\n`,
+            "utf8",
+        );
+    };
+
+    const buildFinish = (finishReason: string, usage: Record<string, unknown> | null): Buffer =>
+        Buffer.from(
+            `data: ${JSON.stringify({
+                ...makeBase(),
+                choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+                ...(usage ? { usage } : {}),
+            })}\n\n`,
+            "utf8",
+        );
+
+    return {
+        buildRequest(coreMessages, systemPrompt, body) {
+            // Kernel 0.0.37 hoists the leading system/developer prefix out of
+            // the openai fold space (fingerprints must not depend on host
+            // runtime state), so coreMessages no longer carries it — re-inject
+            // the CLIENT's original system ahead of the compress prompt,
+            // mirroring the anthropic adapter's anthropicSystem path.
+            const messages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(coreMessages)));
+            const withSys = injectOpenaiSystem(messages, [clientSystem, systemPrompt].filter((p): p is string => typeof p === "string" && p.length > 0));
+            const withNotes = notes && notes.length > 0
+                ? [...withSys, ...notes.map((text) => ({ role: "user" as const, content: text }))]
+                : withSys;
+            return { ...body, messages: withNotes };
+        },
+
+        async *parseStream(upstream, round) {
+            const pending = new Map<number, ToolCallBuffer>();
+            // #206: strip model-imitated render tags from content deltas; the
+            // filter may hold back a short tail, flushed at finish/[DONE].
+            const tagFilter = composeStreamFilters(
+                composeStreamFilters(
+                    createTagEchoFilter((snippet) => {
+                        loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                    createMarkerLineFilter((snippet) => {
+                        loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                ),
+                createBiliArtifactFilter((snippet) => {
+                    loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+            );
+            const flushFilter = function* (): Generator<ParsedStreamEvent> {
+                const tail = tagFilter.flush();
+                if (tail.length > 0) {
+                    yield { kind: "text", delta: tail, raw: buildContent(tail) } as ParsedStreamEvent;
+                }
+            };
+            let sawReasoning = false;
+            let toolCallsEmitted = 0;
+            let degenerateWarned = false;
+            const maybeWarnDegenerate = (reason: string | undefined) => {
+                if (degenerateWarned) return;
+                const msg = degenerateTurnWarning({ reason, terminalReason: "stop", toolCalls: toolCallsEmitted, text: tagFilter.stats(), sawThinking: sawReasoning, wire: "openai" });
+                if (msg) {
+                    degenerateWarned = true;
+                    loggerLog("warn", msg);
+                }
+            };
+            // Raw tool_call chunks in arrival order. Backends (SGLang/vLLM)
+            // stream a tool name across MULTIPLE deltas — the first fragment
+            // carries the name, continuation fragments carry empty names.
+            // Deciding "proxy vs real" per-chunk loses the name entirely (the
+            // name chunk gets buffered while an empty-name continuation flips
+            // the stream into passthrough mode, and the flush is then skipped).
+            // So: buffer EVERYTHING, decide once at finish.
+            const rawToolChunks: { json: string; parsed: Record<string, unknown> }[] = [];
+            let sawRealToolCall = false;
+            // #1306: pure accumulation of one frame's tool_call fragments. Runs
+            // BEFORE the finish_reason settle so arguments sharing a chunk with
+            // finish_reason reach the settle (a settle-first order flushed the
+            // call with truncated args, cleared pending, and re-buffered the
+            // fragment as a nameless orphan the [DONE] settle dropped).
+            const absorbToolCallDeltas = (tcs: Array<Record<string, unknown>>): void => {
+                for (const tc of tcs) {
+                    const idx = typeof tc.index === "number" ? tc.index : 0;
+                    const fn = tc.function as Record<string, unknown> | undefined;
+                    const name = typeof fn?.name === "string" ? fn.name : "";
+                    const id = typeof tc.id === "string" ? tc.id : "";
+                    const rawArgs = fn?.arguments;
+                    const args = typeof rawArgs === "string" ? rawArgs : (rawArgs !== null && typeof rawArgs === "object" ? JSON.stringify(rawArgs) : "");
+                    let buf = pending.get(idx);
+                    if (!buf) {
+                        buf = { index: idx, id, name, arguments: args, frags: 1, nameInFirst: name.length > 0 };
+                        pending.set(idx, buf);
+                    } else {
+                        if (id) buf.id = id;
+                        buf.name += name;
+                        buf.arguments += args;
+                        buf.frags += 1;
+                    }
+                }
+            };
+            const flushPendingAsStructured = function* (): Generator<ParsedStreamEvent> {
+                for (const [idx, tc] of pending) {
+                    if (tc.name.length > 0 || tc.id.length > 0) {
+                        toolCallsEmitted++;
+                        // #1039 invariant: arguments are user intent, verbatim — see tag-echo-filter.ts header.
+                        yield {
+                            kind: "tool_call",
+                            name: tc.name,
+                            callId: tc.id,
+                            arguments: tc.arguments,
+                        } as ParsedStreamEvent;
+                    } else if (tc.arguments.length > 0) {
+                        loggerLog("warn", `[acp-openai] dropping orphan tool_call buffer idx=${idx} argsLen=${tc.arguments.length} (#1306)`);
+                    }
+                }
+                pending.clear();
+            };
+            // Decide proxy-vs-real from the ACCUMULATED names and emit events:
+            // real calls → raw replay (verbatim chunks, original ids/order) +
+            // passthrough-flagged structured events so the loop counts them;
+            // proxy calls → structured events (server-side execution).
+            const settleToolCalls = function* (): Generator<ParsedStreamEvent> {
+                if (pending.size === 0) return;
+                const realIndexes = new Set<number>();
+                for (const [idx, tc] of pending) {
+                    // absorb joins PROXY_TOOL_SET dynamically: its name is configurable per session,
+                    // and misclassifying it as real would raw-replay its chunks to the client.
+                    if (tc.name.length > 0 && !PROXY_TOOL_SET.has(tc.name) && tc.name !== absorbName) realIndexes.add(idx);
+                }
+                sawRealToolCall = realIndexes.size > 0;
+                // #1484: per-call frame summary at the transform boundary so an
+                // upstream-vs-proxy bisection is possible when a client reports a
+                // malformed tool frame. Warn when any settled call has no accumulated
+                // name — exactly the shape clients reject at assembly.
+                {
+                    const parts: string[] = [];
+                    let anyNameless = false;
+                    for (const idx of [...pending.keys()].sort((a, b) => a - b)) {
+                        const tc = pending.get(idx)!;
+                        if (tc.name.length === 0) anyNameless = true;
+                        const disp = realIndexes.has(idx) ? "replayed" : tc.name.length === 0 ? "nameless" : "proxy";
+                        parts.push(`idx=${idx} name=${tc.name.length > 0 ? JSON.stringify(tc.name) : "<none>"}${tc.id ? ` id=${tc.id}` : ""} argsLen=${tc.arguments.length} frags=${tc.frags}${tc.nameInFirst === false ? " name-split" : ""} → ${disp}`);
+                    }
+                    yield {
+                        kind: "diag",
+                        level: anyNameless ? "warn" : "info",
+                        message: `[acp-openai] round ${round} tool-frame settle (${parts.length}): ${parts.join(" | ")}`,
+                    } as ParsedStreamEvent;
+                }
+                if (!sawRealToolCall) {
+                    yield* flushPendingAsStructured();
+                    return;
+                }
+                for (const [idx, tc] of pending) {
+                    if (realIndexes.has(idx) && (tc.name.length > 0 || tc.id.length > 0)) {
+                        toolCallsEmitted++;
+                        yield {
+                            kind: "tool_call",
+                            name: tc.name,
+                            callId: tc.id,
+                            arguments: tc.arguments,
+                            passthrough: true,
+                        } as ParsedStreamEvent;
+                    }
+                }
+                for (const { json, parsed } of rawToolChunks) {
+                    const filtered = filterRealToolFragments(parsed, realIndexes);
+                    if (filtered === "keep") {
+                        yield { kind: "meta", chunk: Buffer.from("data: " + json + "\n\n", "utf8") } as ParsedStreamEvent;
+                    } else if (filtered !== null) {
+                        yield { kind: "meta", chunk: Buffer.from("data: " + JSON.stringify(filtered) + "\n\n", "utf8") } as ParsedStreamEvent;
+                    }
+                }
+                for (const [idx, tc] of pending) {
+                    if (!realIndexes.has(idx) && tc.name.length > 0) {
+                        toolCallsEmitted++;
+                        yield {
+                            kind: "tool_call",
+                            name: tc.name,
+                            callId: tc.id,
+                            arguments: tc.arguments,
+                        } as ParsedStreamEvent;
+                    }
+                }
+                pending.clear();
+            };
+            for await (const eventStr of iterSseChunks(upstream)) {
+                const dataLine = eventStr.split("\n").find((l) => l.startsWith("data:"));
+                if (!dataLine) continue;
+                const jsonStr = dataLine.slice(5).trim();
+                if (jsonStr === "[DONE]") {
+                    yield* flushFilter();
+                    if (sawRealToolCall) {
+                        yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
+                        continue;
+                    }
+                    yield* settleToolCalls();
+                    if (sawRealToolCall) {
+                        yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
+                    }
+                    maybeWarnDegenerate("stop");
+                    yield { kind: "done", finishReason: "stop", thinking: sawReasoning, ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
+                    continue;
+                }
+                let parsed: Record<string, unknown>;
+                try {
+                    parsed = JSON.parse(jsonStr);
+                } catch {
+                    continue;
+                }
+                const rawBuf = Buffer.from(eventStr + "\n\n", "utf8");
+                // OpenAI-compatible gateways may report an upstream failure as
+                // an in-band error frame while the HTTP response remains 200.
+                // Do not ignore it just because it has no choices: if parsing
+                // continues to [DONE], the loop would synthesize a successful
+                // empty stop turn and the client could stall or lose retry
+                // semantics. Surface the error through the normal error path,
+                // which emits a protocol error without a fabricated completion.
+                const streamError = parsed.error;
+                if (streamError !== undefined && streamError !== null) {
+                    let message: string;
+                    if (typeof streamError === "string") {
+                        message = streamError;
+                    } else if (typeof streamError === "object") {
+                        const error = streamError as Record<string, unknown>;
+                        const detail = typeof error.message === "string" ? error.message : JSON.stringify(streamError);
+                        const code = typeof error.code === "string" ? error.code : undefined;
+                        message = code && detail ? `${code}: ${detail}` : detail;
+                    } else {
+                        message = String(streamError);
+                    }
+                    yield { kind: "error", message } as ParsedStreamEvent;
+                    return;
+                }
+                const choices = parsed.choices as Array<Record<string, unknown>> | undefined;
+                const choice = choices?.[0];
+                if (!choice) {
+                    if (parsed.usage) {
+                        const u = parsed.usage as Record<string, unknown>;
+                        yield {
+                            kind: "usage",
+                            inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
+                            outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : undefined,
+                            cachedTokens: openaiCachedTokens(u),
+                        } as ParsedStreamEvent;
+                        // #589: include_usage clients (dsh, OpenAI SDK) read usage
+                        // from this trailing empty-choices frame; raw tool-call rounds
+                        // must forward it verbatim, not swallow it into the internal
+                        // ledger.
+                        if (sawRealToolCall) {
+                            yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
+                        }
+                    }
+                    continue;
+                }
+                const delta = choice.delta as Record<string, unknown> | undefined;
+                const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
+                const frameToolCalls = delta?.tool_calls as Array<Record<string, unknown>> | undefined;
+                if (frameToolCalls) absorbToolCallDeltas(frameToolCalls);
+
+                if (finishReason) {
+                    yield* flushFilter();
+                    const hadToolCalls = [...pending.values()].some((tc) => tc.name.length > 0 || tc.id.length > 0);
+                    yield* settleToolCalls();
+                    const u = parsed.usage as Record<string, unknown> | undefined;
+                    yield {
+                        kind: "usage",
+                        inputTokens: typeof u?.prompt_tokens === "number" ? u.prompt_tokens : undefined,
+                        outputTokens: typeof u?.completion_tokens === "number" ? u.completion_tokens : undefined,
+                        cachedTokens: u ? openaiCachedTokens(u) : undefined,
+                    } as ParsedStreamEvent;
+                    if (sawRealToolCall) {
+                        // The raw finish chunk (provider-measured usage) reaches
+                        // the host verbatim — no rewriting.
+                        const chunk = rawBuf;
+                        // This verbatim chunk IS the round's authoritative completion
+                        // (suppressCompletion); write it once and never fall through
+                        // to the text/reasoning branches (which would re-emit the same
+                        // bytes after the finish reason).
+                        yield { kind: "meta", chunk } as ParsedStreamEvent;
+                        maybeWarnDegenerate(finishReason);
+                        yield { kind: "done", finishReason, suppressCompletion: true, thinking: sawReasoning } as ParsedStreamEvent;
+                        continue;
+                    } else {
+                        maybeWarnDegenerate(finishReason);
+                        yield {
+                            kind: "done",
+                            finishReason: hadToolCalls && finishReason === "stop" ? "tool_calls" : finishReason,
+                            thinking: sawReasoning,
+                        } as ParsedStreamEvent;
+                    }
+                }
+
+                if (!delta) continue;
+
+                if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+                    sawReasoning = true;
+                    yield { kind: "reasoning", delta: delta.reasoning_content, raw: finishReason ? stripFinishReasonChunk(rawBuf) : rawBuf } as ParsedStreamEvent;
+                }
+
+                if (frameToolCalls) {
+                    rawToolChunks.push({ json: jsonStr, parsed });
+                    if (typeof delta.content === "string" && delta.content.length > 0) {
+                        const clean = tagFilter.push(delta.content);
+                        if (clean.length > 0) {
+                            yield { kind: "text", delta: clean } as ParsedStreamEvent;
+                        }
+                    }
+                    continue;
+                }
+
+                const hasReasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0;
+                if (typeof delta.content === "string" && delta.content.length > 0) {
+                        const clean = tagFilter.push(delta.content);
+                        if (clean.length > 0) {
+                            const raw = clean === delta.content ? rawBuf : rewriteContentChunk(parsed, clean);
+                            yield { kind: "text", delta: clean, ...(hasReasoning ? {} : { raw: finishReason ? stripFinishReasonChunk(raw) : raw }) } as ParsedStreamEvent;
+                        }
+                } else if (!hasReasoning && (delta.role || (Object.keys(delta).length === 0 && !finishReason))) {
+                    yield { kind: "meta", chunk: finishReason ? stripFinishReasonChunk(rawBuf) : rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                }
+            }
+        },
+
+        emitText(delta) {
+            return buildContent(delta);
+        },
+
+        emitReasoning(delta) {
+            return buildReasoning(delta);
+        },
+
+        emitToolCall(call) {
+            return buildToolCall(call);
+        },
+
+        emitMarker(toolName, result) {
+            return buildContent(buildVisibilityMarker(toolName, result));
+        },
+
+        emitCompletion(opts?: EmitCompletionOpts) {
+            const finishReason = opts?.finishReason ?? "stop";
+            // Numeric fields must never serialize to absent/undefined: strict
+            // clients (dsh's mapUsage) compute over prompt_tokens/completion_tokens
+            // and a usage object missing them yields NaN (non-JSON-serializable).
+            const usage = opts?.usage
+                ? {
+                      prompt_tokens: opts.usage.inputTokens ?? 0,
+                      completion_tokens: opts.usage.outputTokens ?? 0,
+                      total_tokens: (opts.usage.inputTokens ?? 0) + (opts.usage.outputTokens ?? 0),
+                      ...(typeof opts.usage.cachedTokens === "number"
+                          ? { prompt_tokens_details: { cached_tokens: opts.usage.cachedTokens } }
+                          : {}),
+                  }
+                : null;
+            return Buffer.concat([buildFinish(finishReason, usage), Buffer.from("data: [DONE]\n\n", "utf8")]);
+        },
+
+        emitError(message) {
+            // #1455: present the failure AS a failure (see the anthropic twin). The
+            // legacy shape — error text + finish_reason "stop" + [DONE] — read as a
+            // normal completion to clients and suppressed their retry logic. The
+            // default now rides the top-level `error` frame bili's own parser already
+            // recognizes (same shape #721's truncation path emits); compat.
+            // streamErrorShape="completion" restores the legacy shape.
+            if (errorShape === "completion") {
+                return Buffer.concat([
+                    buildContent(`\n[acp-proxy: ${message}]\n`),
+                    buildFinish("stop", null),
+                    Buffer.from("data: [DONE]\n\n", "utf8"),
+                ]);
+            }
+            return Buffer.concat([
+                Buffer.from(`data: ${JSON.stringify({ error: { type: "server_error", code: "upstream_error", message: `[acp-proxy: ${message}]` } })}\n\n`, "utf8"),
+                Buffer.from("data: [DONE]\n\n", "utf8"),
+            ]);
+        },
+    };
+}
