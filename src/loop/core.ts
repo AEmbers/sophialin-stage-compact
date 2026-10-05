@@ -13,6 +13,7 @@ import {
     ABSORB_TOOL_NAME,
     COMPRESS_TOOL_NAME,
     RULE_TOOL_NAME,
+    withContinuationAnchor,
 } from "../compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
@@ -240,7 +241,7 @@ export function executeProxyTool(
         // string here — the kernel's lenient parser salvages fence/trailing-
         // comma/single-quote/truncated inputs that the degraded {} would drop.
         const input = typeof rawArguments === "string" && rawArguments.length > 0 ? rawArguments : args;
-        return applyRanges(parseCompressInput(input, callId), ctx);
+        return withContinuationAnchor(applyRanges(parseCompressInput(input, callId), ctx));
     }
     if (toolName === "decompress") {
         return resolveDecompress(args, ctx);

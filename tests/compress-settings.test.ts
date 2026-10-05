@@ -5,6 +5,7 @@ import {
     mergeCompress,
     resolveCompress,
     applyCompressSettings,
+    growthStepOutOfScale,
     hasCompressSettings,
     resolveContextLimitValue,
     resolveCompressPrompts,
@@ -375,4 +376,14 @@ test("parseCompressSettings: parses priceProfile sub-fields and rejects malforme
     assert.equal(parseCompressSettings({ priceProfile: { r: "cheap" } }), undefined);
     assert.equal(parseCompressSettings({ priceProfile: { q: Number.NaN } }), undefined);
     assert.deepEqual(parseCompressSettings({ priceProfile: { x: 3 } })?.priceProfile, {});
+});
+
+test("a growth step past a quarter of the window is out of scale", () => {
+    // The live shape this exists for: 350000 on a 1M window kept the growth
+    // layer idle for 120 consecutive turns while usage drifted to 148%.
+    assert.equal(growthStepOutOfScale(350_000, 1_000_000), true, "the observed live config");
+    assert.equal(growthStepOutOfScale(50_000, 1_000_000), false, "the kernel's adaptive band for a 1M window");
+    assert.equal(growthStepOutOfScale(50_001, 200_000), true, "just past a quarter");
+    assert.equal(growthStepOutOfScale(50_000, 200_000), false, "exactly a quarter is still in scale");
+    assert.equal(growthStepOutOfScale(50_000, 0), false, "an unknown window never warns");
 });

@@ -48,7 +48,7 @@
 // openai tool list, src/compress-tool.ts) because reload-based refresh is not
 // available on all observed surfaces.
 
-import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
+import { BILI_COMPRESS_OPENAI_TOOLS, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
@@ -134,7 +134,7 @@ const WINDOW_REFRESH_MS = 60000;
 // Kill switch = fully inert (same semantics as detectProxyBase): gates header stamping, tool forwarding, compaction reporting.
 const pluginDisabled = (): boolean => process.env.BILLION_CONTEXT_PLUGIN === "0";
 
-const V2_BILI_TOOLS = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map((t) => ({
+const V2_BILI_TOOLS = [...BILI_COMPRESS_OPENAI_TOOLS, ABSORB_TOOL_OPENAI].map((t) => ({
     name: t.function.name,
     description: t.function.description,
     input: t.function.parameters,

@@ -304,6 +304,25 @@ export function resolveAbsorbSettings(s: CompressSettings["absorb"]): AbsorbConf
     };
 }
 
+let warnedGrowthStepScale = false;
+
+/** A growth step past a quarter of the window is out of scale: the growth layer
+ *  counts *compressible* tokens, so the nudge stays idle until that much stale
+ *  content has accumulated. A live 1M-window deployment configured with 350000
+ *  produced 120 consecutive idle turns while usage drifted to 148% before the
+ *  emergency line fired. The kernel's own adaptive band is ~5% of the window;
+ *  the value is legitimate, it is just almost never the scale the operator
+ *  meant. */
+export function growthStepOutOfScale(step: number, limit: number): boolean {
+    return limit > 0 && step > limit * 0.25;
+}
+
+function warnGrowthStepOutOfScale(step: number, limit: number): void {
+    if (warnedGrowthStepScale || !growthStepOutOfScale(step, limit)) return;
+    warnedGrowthStepScale = true;
+    loggerLog("warn", `[compress] nudgeGrowthTokens (${step}) is ${Math.round((step / limit) * 100)}% of the context window (${limit}) — the growth-layer nudge stays idle until that much compressible content accumulates, which can be most of a session. The adaptive band is ~5% of the window (${Math.round(limit * 0.05)}); clear this override or lower it if you expect day-to-day folding.`);
+}
+
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): ResolvedKernelConfig {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
@@ -316,6 +335,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     if (s.nudgeGrowthTokens !== undefined && s.nudgeGrowthTokens > 0) {
         nudge.growthFloor = s.nudgeGrowthTokens;
         nudge.growthCap = s.nudgeGrowthTokens;
+        warnGrowthStepOutOfScale(s.nudgeGrowthTokens, limit);
     }
     const tiers = { ...base.tiers };
     if (s.tiers !== undefined) tiers.enabled = s.tiers;

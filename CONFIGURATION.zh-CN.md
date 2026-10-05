@@ -370,7 +370,7 @@
 - **类型：** `number`
 - **默认值：** `50000`
 - **状态：** ACTIVE
-- **说明：** 软压缩 nudge 的 token 增长步长。每当有这么多 token 变为可压缩时，大约就会触发一次 nudge。值越小，nudge 越频繁。映射到内核字段 `nudge.growthFloor` 和 `nudge.growthCap`（它将引擎的自适应区间扁平化为这个固定步长）。
+- **说明：** 软压缩 nudge 的 token 增长步长。每当有这么多 token 变为可压缩时，大约就会触发一次 nudge。值越小，nudge 越频繁。映射到内核字段 `nudge.growthFloor` 和 `nudge.growthCap`（它将引擎的自适应区间扁平化为这个固定步长）。**请按窗口大小缩放。** 该步长统计的是*可压缩* token，因此取值一旦占窗口的很大比例，增长层在整个会话的大部分时间里都是沉默的——一个 1M 窗口的线上部署把它设成 `350000`，结果连出 120 轮 idle，usage 一路飘到 148% 才由应急线兜住。内核的自适应区间约为窗口的 5%（它的默认值 50000 对 1M 窗口本来就等于这个比例）；一旦超过窗口的四分之一，启动时会一次性告警 `nudgeGrowthTokens … % of the context window`。除非你确实想要比 ~5% 更粗或更细的节奏，否则不要设置它。
 
 #### `preserveRecentMessages`
 

@@ -56,7 +56,7 @@
 //   - tool: { [name]: { description, args, execute } } registers native tools;
 //     args must be REAL zod fields (registry wraps them with its own
 //     z.object(...).safeParse) — hence zod is a runtime dependency, lazily
-//     imported below. Same tool set/schemas as V2 (ACP_TOOLS_OPENAI),
+//     imported below. Same tool set/schemas as V2 (BILI_COMPRESS_OPENAI_TOOLS),
 //     converted JSON-schema → zod. When zod cannot be resolved (dist copied
 //     without node_modules) the plugin degrades to proxy mode: no headers, no
 //     tools — the proxy injects wire tools, compression still works.
@@ -66,7 +66,7 @@
 //     (written by the config hook, same as the launcher/installer) is the
 //     owner-switch; no compaction-prompt surgery needed.
 
-import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
+import { BILI_COMPRESS_OPENAI_TOOLS } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
@@ -658,7 +658,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
         } else {
             const tools: Record<string, V1Tool> = {};
             if (deps.z !== undefined) {
-                for (const t of ACP_TOOLS_OPENAI) {
+                for (const t of BILI_COMPRESS_OPENAI_TOOLS) {
                     const fn = t.function;
                     tools[fn.name] = {
                         description: fn.description ?? fn.name,
