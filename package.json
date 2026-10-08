@@ -67,7 +67,7 @@
     "tsx": "^4.0.0",
     "typescript": "^5.5.0",
     "undici": "^7.29.0",
-    "verdaccio": "^6.10.4"
+    "verdaccio": "^6.10.5"
   },
   "engines": {
     "node": ">=20"
